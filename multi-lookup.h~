@@ -1,0 +1,34 @@
+#ifndef MULTI_LOOKUP_H
+#define MULTI_LOOKUP_H
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include "util.h"
+#include <pthread.h>
+#include <unistd.h>
+#include <queue.h>
+
+/* Implementing the Producer-Consumer architecture. 
+ * Producer sub-system uses requester thread pool
+ * Consumer sub-system uses resolver thread pool */
+ 
+ /* Services a set of name files, each name read is placed
+  * on a FIFO queue */
+void* producer(char* namefile);
+
+/* Producer pool, creates and joins threads for producer stage */
+void* request_thread_pool(char* input_names);
+
+/* Services the FIFO queue by taking a name off the queue and
+ * querying its IP address */
+void* consumer();
+
+/* Conumser pool, creates and joins threads for consumer stage */
+void* resolver_thread_pool();
+
+/*Initialize local vars and run the thread architecture */
+int main(int argc, char* argv[]);
+
+#endif

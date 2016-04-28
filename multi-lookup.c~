@@ -1,0 +1,250 @@
+/*
+ * File: multi-lookup.c
+ * Author: Jake Traut
+ * Creator: Andy Sayler
+ * Project: CSCI 3753 Programming Assignment 3
+ * Create Date: 2012/02/01
+ * Modify Date: 2016/03/02
+ * Description:
+ * 	This file contains the multi-threaded
+ *      solution to this assignment, that resolves 
+		domain names to IP addresses. 
+ *  
+ */
+
+#include <multi-lookup.h>
+
+#define MINARGS 3
+#define USAGE "<inputFilePath> <outputFilePath>"
+#define SBUFSIZE 1025 //equivalent to MAX_NAME_LENGTH 
+#define INPUTFS "%1024s"
+#define MAX_INPUT_FILES 10
+#define MAX_RESOLVER_THREADS 10
+#define MIN_RESOLVER_THREADS 2
+#define MAX_NAME_LENGTH 1025
+#define MAX_IP_LENGTH INET6_ADDRSTRLEN
+#define QUEUE_SIZE 1024
+
+FILE* inputfp = NULL;
+FILE* outputfp = NULL;
+
+queue q; //FIFO queue, not thread-safe, must protect from deadlock
+int FILES_TO_SERVICE;
+int SERVICED_FILES_COUNT = 0; //shared resource, protect from deadlock
+char* OUTPUT_FILE;
+
+pthread_mutex_t queue_mutex;
+pthread_mutex_t incrementer_mutex;
+pthread_mutex_t output_mutex;
+
+void* producer(char* namefile){
+	char* hostname = (char*)malloc(MAX_NAME_LENGTH*sizeof(char));
+    char errorstr[SBUFSIZE];	
+    int push_counter = 0;
+	inputfp = fopen(namefile, "r");
+	
+	if(!inputfp){
+	    sprintf(errorstr, "Error Opening Input File: %s", namefile);
+	    perror(errorstr);
+	    fprintf(stderr, errorstr);
+	    return NULL;
+	}	
+		
+	//read each file and push domain name onto FIFO queue
+	while(fscanf(inputfp, INPUTFS, hostname) > 0){
+		
+		pthread_mutex_lock(&queue_mutex) //lock the queue, avoid deadlock
+		//check if thread is full, if so sleep
+		if(queue_is_full(&q)){
+			pthread_mutex_unlock(&queue_mutex); //unlock to make room
+			usleep(rand()%100); //sleep random period of time between 0-100 microseconds
+			pthread_mutex_lock(&queue_mutex); //relock to push to queue
+		}
+		
+		//push onto queue, and check for success
+		if(queue_push(&q, strdup(hostname)) == QUEUE_FAILURE){
+			fprintf(stderr, "ERROR: queue_push failed for %s\n", strdup(hostname))
+		}
+		pthread_mutex_unlock(&queue_mutex); //done with queue so unlock
+		push_counter++; //increment counter for requester thread
+		
+		//create new string buffer for every name
+		hostname = (char*)malloc(MAX_NAME_LENGTH*sizeof(char));
+	}
+	
+	//safely increment the counter
+	pthread_mutex_lock(&incrementer_mutex);
+	SERVICED_FILES_COUNT++;
+	pthread_mutex_unlock(&incrementer_mutex);
+	
+	printf("Requester thread added %d hostnames to queue.\n", push_count);
+	
+	free(hostname); //free this chunk of memory
+	hostname = NULL;
+	
+	//done reading, close file and exit
+	fclose(inputfp);
+	pthread_exit(NULL);
+	return NULL;
+}
+
+void* request_thread_pool(char* input_names){
+	
+	pthread_t requester_threads[FILES_TO_SERVICE];
+	fflush(stdout);
+	
+	int i = 0;
+	//loop through all input files 
+	for(i; i < FILES_TO_SERVICE; i++){
+		//creating threads for producer stage 
+		pthread_create(&requester_threads[i], NULL, producer, input_names[i]);
+		pthread_join(requester_threads[i], NULL);
+	}
+	
+	return NULL;
+	
+}
+
+void* consumer(){
+	outputfp = fopen(OUTPUT_FILE, "w");
+	if(!outputfp){
+	perror("Error Opening Output File");
+	fprintf(stderr, "Error Opening Output File");
+	return NULL;
+    }
+    
+    char* current_hostname;
+    char firstipstr[INET6_ADDRSTRLEN];
+    int pop_counter = 0;
+    
+    //working with queue, avoid deadlock
+    pthread_mutex_lock(&queue_mutex);
+    queue_status = !queue_is_empty(&q); //check if empty or full
+    pthread_mutex_unlock(&queue_mutex);    
+    
+    int more_work = 0;
+    //working with incrementer, avoid deadlock
+    pthread_mutex_lock(&incrementer_mutex);
+    if(SERVICED_FILES_COUNT < FILES_TO_SERVICE || queue_status){
+		more_work = 1;
+	}
+	pthread_mutex_unlock(&incrementer_mutex);
+		
+    //Continue to pull from queue 
+    while(more_work){
+		
+		pthread_mutex_lock(&incrementer_mutex);
+		if(SERVICED_FILES_COUNT == FILES_TO_SERVICE) more_work = 0;
+		pthread_mutex_unlock(&incrementer_mutex);
+		
+		if(!more_work) return NULL;
+
+		pthread_mutex_lock(&queue_mutex);
+		//pop hostname off queue and check for success
+		if((current_hostname = (char*)queue_pop(&q)) == NULL){
+			fprintf(stderr, "ERROR: queue_pop failed with hostname: %s\n", current_hostname);
+			pthread_mutex_unlock(&queue_mutex);
+		}
+		else{ //successful
+			pthread_mutex_unlock(&queue_mutex);
+			
+			pop_counter++; //increment the counter for resolver thread
+			
+			 /* Lookup hostname and get IP string */
+			if(dnslookup(hostname, firstipstr, sizeof(firstipstr)) == UTIL_FAILURE){
+				fprintf(stderr, "dnslookup error: %s\n", hostname);
+				strncpy(firstipstr, "", sizeof(firstipstr));
+			}
+			
+			/* Write to Output File */
+			pthread_mutex_lock(&output_mutex);
+			fprintf(outputfp, "%s,%s\n", current_hostname, firstipstr);
+			pthread_mutex_unlock(&output_mutex);
+	
+			free(current_hostname); //free memory from queue
+			current_hostname = NULL;
+		}
+		
+		//check if work is done
+		    //working with queue, avoid deadlock
+		pthread_mutex_lock(&queue_mutex);
+		queue_status = !queue_is_empty(&q); //check if empty or full
+		pthread_mutex_unlock(&queue_mutex);    
+
+		//working with incrementer, avoid deadlock
+		pthread_mutex_lock(&incrementer_mutex);
+		if(SERVICED_FILES_COUNT < FILES_TO_SERVICE || queue_status){
+			more_work = 1;
+		}
+		else more_work = 0;
+		pthread_mutex_unlock(&incrementer_mutex);
+	}
+	printf("Resolver thread processed %d hostnames from queue.\n", pop_counter); //print how much work thread did 
+	pthread_exit(NULL);
+	fclose(outputfp);
+	return NULL;
+}
+
+void* resolver_thread_pool(){
+	//creating threads for the consumer stage
+	pthread_t resolver_threads[FILES_TO_SERVICE];
+	int i = 0;
+	for(i; i < MAX_RESOLVER_THREADS; i++){
+		pthread_create(&resolver_threads[i], NULL, consumer, NULL);
+		pthread_join(resolver_threads[i], NULL);
+	}
+	return NULL;
+}
+
+int main(int argc, char* argv[]){
+
+	FILES_TO_SERVICE = argc - 2; //-1 for original call -1 for resolve.txt
+	SERVICED_FILES_COUNT = 0;
+	char* name_files[FILES_TO_SERVICE];
+	OUTPUT_FILE = argv[argc-1]; //last arg is the output file
+	int producer_status;
+	int consumer_status;
+
+	fflush(stdout);
+	
+	//Initialize the vars
+	queue_init(&q, QUEUE_SIZE);
+	pthread_mutex_init(&queue_mutex, NULL);
+	pthread_mutex_init(&incrementer_mutex, NULL);
+	pthread_mutex_init(&output_mutex, NULL);
+	
+    /* Check Arguments */
+    if(argc < MINARGS){
+	fprintf(stderr, "Not enough arguments: %d\n", (argc - 1));
+	fprintf(stderr, "Usage:\n %s %s\n", argv[0], USAGE);
+	return EXIT_FAILURE;
+    }
+	
+	//fill in name_files array
+	int i = 0;
+	for(i; i < FILES_TO_SERVICE; i++){
+		name_files[i] = argv[i+1];
+	}
+	
+	pthread_t producer_id;
+	pthread_t consumer_id;
+	
+	//use the request/resolver thread pools
+	producer_status = pthread_create(&producer_id, NULL, request_thread_pool, name_files);
+	consumer_status = pthread_create(&consumer_id, NULL, resolver_thread_pool, NULL);
+	
+	if(producer_status || consumer_status){
+		printf("Error with threads\n");
+	}
+	else{
+		pthread_join(consumer_id, NULL);
+		pthread_join(producer_id, NULL);
+	}
+	
+	queue_cleanup(&q); 
+	pthread_mutex_destroy(&queue_mutex);
+	pthread_mutex_destroy(&output_mutex);
+	pthread_mutex_destroy(&incrementer_mutex);
+
+    return EXIT_SUCCESS;
+}
